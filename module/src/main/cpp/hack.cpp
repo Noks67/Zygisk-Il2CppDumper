@@ -17,27 +17,191 @@
 #include <linux/unistd.h>
 #include <fcntl.h>
 #include <array>
+#include <link.h>
+#include <string>
+
+// ЖЕЛЕЗОБЕТОННЫЙ МЕТОД 1: Поиск через /proc/self/maps с полным путем
+void* find_library_via_maps(const char* lib_name) {
+    FILE* maps = fopen("/proc/self/maps", "r");
+    if (!maps) {
+        LOGE("Failed to open /proc/self/maps");
+        return nullptr;
+    }
+    
+    char line[1024];
+    void* handle = nullptr;
+    
+    while (fgets(line, sizeof(line), maps)) {
+        // Ищем библиотеку по имени
+        char* lib_path = strstr(line, lib_name);
+        if (!lib_path) continue;
+        
+        // Проверяем что это исполняемая секция (r-xp)
+        if (!strstr(line, "r-xp")) continue;
+        
+        // Извлекаем полный путь (после последнего пробела)
+        char* path_start = strrchr(line, ' ');
+        if (!path_start) continue;
+        path_start++; // Пропускаем пробел
+        
+        // Убираем перенос строки
+        size_t len = strlen(path_start);
+        if (len > 0 && path_start[len-1] == '\n') {
+            path_start[len-1] = '\0';
+        }
+        
+        LOGI("Found library in maps: %s", path_start);
+        
+        // Пробуем открыть по полному пути
+        handle = dlopen(path_start, RTLD_NOW | RTLD_NOLOAD);
+        if (handle) {
+            LOGI("dlopen success via maps: %s -> %p", path_start, handle);
+            fclose(maps);
+            return handle;
+        }
+        
+        // Если RTLD_NOLOAD не сработал, пробуем обычный dlopen
+        handle = dlopen(path_start, RTLD_NOW);
+        if (handle) {
+            LOGI("dlopen success (force) via maps: %s -> %p", path_start, handle);
+            fclose(maps);
+            return handle;
+        }
+    }
+    
+    fclose(maps);
+    return nullptr;
+}
+
+// ЖЕЛЕЗОБЕТОННЫЙ МЕТОД 2: Поиск через dl_iterate_phdr
+static void* g_found_handle = nullptr;
+static const char* g_target_lib = nullptr;
+
+static int dl_iterate_callback(struct dl_phdr_info *info, size_t size, void *data) {
+    if (!info->dlpi_name || strlen(info->dlpi_name) == 0) {
+        return 0;
+    }
+    
+    // Проверяем совпадение имени библиотеки
+    const char* lib_name = strrchr(info->dlpi_name, '/');
+    if (lib_name) lib_name++;
+    else lib_name = info->dlpi_name;
+    
+    if (strstr(lib_name, g_target_lib)) {
+        LOGI("dl_iterate found: %s (base: %p)", info->dlpi_name, (void*)info->dlpi_addr);
+        
+        // Пробуем открыть
+        void* handle = dlopen(info->dlpi_name, RTLD_NOW | RTLD_NOLOAD);
+        if (!handle) {
+            handle = dlopen(info->dlpi_name, RTLD_NOW);
+        }
+        
+        if (handle) {
+            g_found_handle = handle;
+            return 1; // Остановить итерацию
+        }
+    }
+    
+    return 0;
+}
+
+void* find_library_via_dl_iterate(const char* lib_name) {
+    g_found_handle = nullptr;
+    g_target_lib = lib_name;
+    
+    dl_iterate_phdr(dl_iterate_callback, nullptr);
+    
+    return g_found_handle;
+}
+
+// ЖЕЛЕЗОБЕТОННЫЙ МЕТОД 3: Комбинированный поиск
+void* find_library_ultimate(const char* lib_name) {
+    void* handle = nullptr;
+    
+    // Метод 1: xdl_open (быстрый)
+    handle = xdl_open(lib_name, 0);
+    if (handle) {
+        LOGI("xdl_open found: %s", lib_name);
+        return handle;
+    }
+    
+    handle = xdl_open(lib_name, XDL_TRY_FORCE_LOAD);
+    if (handle) {
+        LOGI("xdl_open (force) found: %s", lib_name);
+        return handle;
+    }
+    
+    // Метод 2: /proc/self/maps (надежный)
+    handle = find_library_via_maps(lib_name);
+    if (handle) {
+        LOGI("maps method found: %s", lib_name);
+        return handle;
+    }
+    
+    // Метод 3: dl_iterate_phdr (универсальный)
+    handle = find_library_via_dl_iterate(lib_name);
+    if (handle) {
+        LOGI("dl_iterate found: %s", lib_name);
+        return handle;
+    }
+    
+    // Метод 4: dlopen напрямую (последняя попытка)
+    handle = dlopen(lib_name, RTLD_NOW | RTLD_NOLOAD);
+    if (handle) {
+        LOGI("dlopen (direct NOLOAD) found: %s", lib_name);
+        return handle;
+    }
+    
+    return nullptr;
+}
 
 void hack_start(const char *game_data_dir) {
     bool load = false;
     // Brawl Stars uses libg.so instead of libil2cpp.so
     const char* lib_names[] = {"libg.so", "libapp.so", "libil2cpp.so", nullptr};
     
-    for (int i = 0; i < 10; i++) {
+    LOGI("Starting library search with ULTIMATE method...");
+    
+    // Увеличиваем время ожидания - библиотека может загружаться позже
+    for (int i = 0; i < 50; i++) {  // 50 попыток (100 секунд максимум)
         for (int j = 0; lib_names[j] != nullptr; j++) {
-            void *handle = xdl_open(lib_names[j], 0);
+            // ЖЕЛЕЗОБЕТОННЫЙ комбинированный поиск
+            void *handle = find_library_ultimate(lib_names[j]);
+            
             if (handle) {
                 load = true;
+                LOGI("SUCCESS! Found IL2CPP library: %s (handle: %p)", lib_names[j], handle);
                 il2cpp_api_init(handle);
                 il2cpp_dump(game_data_dir);
-                LOGI("Found IL2CPP library: %s", lib_names[j]);
+                LOGI("Dump completed for: %s", lib_names[j]);
                 return;
             }
         }
-        sleep(1);
+        
+        if (i % 5 == 0) {
+            LOGI("Library search attempt %d/50...", i);
+        }
+        
+        sleep(2);  // 2 секунды между попытками
     }
+    
     if (!load) {
-        LOGI("IL2CPP library (libg.so/libapp.so/libil2cpp.so) not found in thread %d", gettid());
+        LOGE("FAILED: IL2CPP library (libg.so/libapp.so/libil2cpp.so) not found after 50 attempts in thread %d", gettid());
+        
+        // Последняя попытка - выводим все загруженные библиотеки для отладки
+        LOGI("Debug: Listing all loaded libraries...");
+        FILE* maps = fopen("/proc/self/maps", "r");
+        if (maps) {
+            char line[1024];
+            int count = 0;
+            while (fgets(line, sizeof(line), maps) && count < 20) {
+                if (strstr(line, ".so") && strstr(line, "r-xp")) {
+                    LOGI("Loaded lib: %s", line);
+                    count++;
+                }
+            }
+            fclose(maps);
+        }
     }
 }
 
