@@ -15,6 +15,7 @@
 #include <thread>
 #include <sys/mman.h>
 #include <linux/unistd.h>
+#include <fcntl.h>
 #include <array>
 
 void hack_start(const char *game_data_dir) {
@@ -166,7 +167,7 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size
                 }
             }
         }
-        close(nb);
+        dlclose(nb);
     } else {
         LOGI("dlopen native bridge error");
         auto fd = open("/proc/self/maps", O_RDONLY);
