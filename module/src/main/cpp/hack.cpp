@@ -19,74 +19,61 @@
 
 void hack_start(const char *game_data_dir) {
     bool load = false;
+    // Brawl Stars uses libg.so instead of libil2cpp.so
+    const char* lib_names[] = {"libg.so", "libapp.so", "libil2cpp.so", nullptr};
+    
     for (int i = 0; i < 10; i++) {
-        void *handle = xdl_open("libil2cpp.so", 0);
-        if (handle) {
-            load = true;
-            il2cpp_api_init(handle);
-            il2cpp_dump(game_data_dir);
-            break;
-        } else {
-            sleep(1);
+        for (int j = 0; lib_names[j] != nullptr; j++) {
+            void *handle = xdl_open(lib_names[j], 0);
+            if (handle) {
+                load = true;
+                il2cpp_api_init(handle);
+                il2cpp_dump(game_data_dir);
+                LOGI("Found IL2CPP library: %s", lib_names[j]);
+                return;
+            }
         }
+        sleep(1);
     }
     if (!load) {
-        LOGI("libil2cpp.so not found in thread %d", gettid());
+        LOGI("IL2CPP library (libg.so/libapp.so/libil2cpp.so) not found in thread %d", gettid());
     }
 }
 
 std::string GetLibDir(JavaVM *vms) {
     JNIEnv *env = nullptr;
     vms->AttachCurrentThread(&env, nullptr);
-    jclass activity_thread_clz = env->FindClass("android/app/ActivityThread");
-    if (activity_thread_clz != nullptr) {
-        jmethodID currentApplicationId = env->GetStaticMethodID(activity_thread_clz,
-                                                                "currentApplication",
-                                                                "()Landroid/app/Application;");
-        if (currentApplicationId) {
-            jobject application = env->CallStaticObjectMethod(activity_thread_clz,
-                                                              currentApplicationId);
-            jclass application_clazz = env->GetObjectClass(application);
-            if (application_clazz) {
-                jmethodID get_application_info = env->GetMethodID(application_clazz,
-                                                                  "getApplicationInfo",
-                                                                  "()Landroid/content/pm/ApplicationInfo;");
-                if (get_application_info) {
-                    jobject application_info = env->CallObjectMethod(application,
-                                                                     get_application_info);
-                    jfieldID native_library_dir_id = env->GetFieldID(
-                            env->GetObjectClass(application_info), "nativeLibraryDir",
-                            "Ljava/lang/String;");
-                    if (native_library_dir_id) {
-                        auto native_library_dir_jstring = (jstring) env->GetObjectField(
-                                application_info, native_library_dir_id);
-                        auto path = env->GetStringUTFChars(native_library_dir_jstring, nullptr);
-                        LOGI("lib dir %s", path);
-                        std::string lib_dir(path);
-                        env->ReleaseStringUTFChars(native_library_dir_jstring, path);
-                        return lib_dir;
-                    } else {
-                        LOGE("nativeLibraryDir not found");
-                    }
-                } else {
-                    LOGE("getApplicationInfo not found");
-                }
-            } else {
-                LOGE("application class not found");
-            }
-        } else {
-            LOGE("currentApplication not found");
-        }
-    } else {
-        LOGE("ActivityThread not found");
-    }
-    return {};
+    jclass activityThread = env->FindClass("android/app/ActivityThread");
+    jmethodID currentApplication = env->GetStaticMethodID(activityThread, "currentApplication", "()Landroid/app/Application;");
+    jobject application = env->CallStaticObjectMethod(activityThread, currentApplication);
+    jclass applicationClass = env->GetObjectClass(application);
+    jmethodID getApplicationInfo = env->GetMethodID(applicationClass, "getApplicationInfo", "()Landroid/content/pm/ApplicationInfo;");
+    jobject applicationInfo = env->CallObjectMethod(application, getApplicationInfo);
+    jclass applicationInfoClass = env->GetObjectClass(applicationInfo);
+    jfieldID nativeLibraryDir = env->GetFieldID(applicationInfoClass, "nativeLibraryDir", "Ljava/lang/String;");
+    jstring nativeLibraryDirString = (jstring)env->GetObjectField(applicationInfo, nativeLibraryDir);
+    const char *nativeLibraryDirChars = env->GetStringUTFChars(nativeLibraryDirString, nullptr);
+    std::string result(nativeLibraryDirChars);
+    env->ReleaseStringUTFChars(nativeLibraryDirString, nativeLibraryDirChars);
+    return result;
 }
 
-static std::string GetNativeBridgeLibrary() {
-    auto value = std::array<char, PROP_VALUE_MAX>();
-    __system_property_get("ro.dalvik.vm.native.bridge", value.data());
-    return {value.data()};
+std::string GetNativeBridgeLibrary() {
+    char value[PROP_VALUE_MAX];
+    __system_property_get("ro.dalvik.vm.native.bridge", value);
+    if (strlen(value) == 0) {
+        return {};
+    }
+    std::array<char, PATH_MAX> path{};
+    snprintf(path.data(), PATH_MAX, "/system/lib%s/houdini.so", sizeof(void *) == 8 ? "64" : "");
+    if (access(path.data(), F_OK) == 0) {
+        return {path.data()};
+    }
+    snprintf(path.data(), PATH_MAX, "/system/lib%s/libhoudini.so", sizeof(void *) == 8 ? "64" : "");
+    if (access(path.data(), F_OK) == 0) {
+        return {path.data()};
+    }
+    return {value};
 }
 
 struct NativeBridgeCallbacks {
@@ -149,36 +136,46 @@ bool NativeBridgeLoad(const char *game_data_dir, int api_level, void *data, size
     }
     if (nb) {
         LOGI("nb %p", nb);
-        auto callbacks = (NativeBridgeCallbacks *) dlsym(nb, "NativeBridgeItf");
-        if (callbacks) {
-            LOGI("NativeBridgeLoadLibrary %p", callbacks->loadLibrary);
-            LOGI("NativeBridgeLoadLibraryExt %p", callbacks->loadLibraryExt);
-            LOGI("NativeBridgeGetTrampoline %p", callbacks->getTrampoline);
-
-            int fd = syscall(__NR_memfd_create, "anon", MFD_CLOEXEC);
-            ftruncate(fd, (off_t) length);
-            void *mem = mmap(nullptr, length, PROT_WRITE, MAP_SHARED, fd, 0);
-            memcpy(mem, data, length);
-            munmap(mem, length);
-            munmap(data, length);
-            char path[PATH_MAX];
-            snprintf(path, PATH_MAX, "/proc/self/fd/%d", fd);
-            LOGI("arm path %s", path);
-
-            void *arm_handle;
-            if (api_level >= 26) {
-                arm_handle = callbacks->loadLibraryExt(path, RTLD_NOW, (void *) 3);
-            } else {
-                arm_handle = callbacks->loadLibrary(path, RTLD_NOW);
-            }
-            if (arm_handle) {
-                LOGI("arm handle %p", arm_handle);
-                auto init = (void (*)(JavaVM *, void *)) callbacks->getTrampoline(arm_handle,
-                                                                                  "JNI_OnLoad",
-                                                                                  nullptr, 0);
-                LOGI("JNI_OnLoad %p", init);
-                init(vms, (void *) game_data_dir);
+        auto NativeBridgeItf = (NativeBridgeCallbacks *) dlsym(nb, "NativeBridgeItf");
+        if (NativeBridgeItf && NativeBridgeItf->version >= 2) {
+            LOGI("NativeBridgeItf version %d", NativeBridgeItf->version);
+            auto handle = NativeBridgeItf->loadLibrary("libil2cpp.so", RTLD_NOW);
+            if (handle) {
+                LOGI("loadLibrary libil2cpp.so %p", handle);
+                il2cpp_api_init(handle);
+                il2cpp_dump(game_data_dir);
+                munmap(data, length);
                 return true;
+            } else {
+                // Try libg.so and libapp.so for Brawl Stars
+                handle = NativeBridgeItf->loadLibrary("libg.so", RTLD_NOW);
+                if (handle) {
+                    LOGI("loadLibrary libg.so %p", handle);
+                    il2cpp_api_init(handle);
+                    il2cpp_dump(game_data_dir);
+                    munmap(data, length);
+                    return true;
+                }
+                handle = NativeBridgeItf->loadLibrary("libapp.so", RTLD_NOW);
+                if (handle) {
+                    LOGI("loadLibrary libapp.so %p", handle);
+                    il2cpp_api_init(handle);
+                    il2cpp_dump(game_data_dir);
+                    munmap(data, length);
+                    return true;
+                }
+            }
+        }
+        close(nb);
+    } else {
+        LOGI("dlopen native bridge error");
+        auto fd = open("/proc/self/maps", O_RDONLY);
+        if (fd >= 0) {
+            char line[1024];
+            while (read(fd, line, sizeof(line)) > 0) {
+                if (strstr(line, "libhoudini") || strstr(line, "libnb")) {
+                    LOGI("maps: %s", line);
+                }
             }
             close(fd);
         }
